@@ -1,6 +1,6 @@
 [package]
 name = "spm-simulator"
-version = "0.1.0"
+version = "0.1.1"
 description = "热轧平整机组排程沙盘模拟系统"
 authors = ["you"]
 license = ""
