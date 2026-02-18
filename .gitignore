@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+
+# Rust / Tauri
+target/
+spm-simulator/src-tauri/target/
+
+# Logs
+*.log
+npm-debug.log*
+
+# 本地环境
+*.local

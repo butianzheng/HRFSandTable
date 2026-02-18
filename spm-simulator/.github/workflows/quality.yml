@@ -1,0 +1,183 @@
+name: quality-gate
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+  pull_request:
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust Dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Format Check
+        run: npm run format:check
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Security Audit (npm)
+        run: npm audit --audit-level=high
+        continue-on-error: true
+
+      - name: Unit Test Coverage
+        run: npm run test:unit:coverage
+
+      - name: Workflow Check
+        run: npm run check:workflow
+
+      - name: Frontend Contract Test
+        run: npm run test:frontend
+
+      - name: E2E Smoke Test
+        run: npm run test:e2e:smoke
+
+      - name: Rust Format Check
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Clippy Lint
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --lib --tests -- -D warnings
+
+      - name: Security Audit (Cargo)
+        run: |
+          cargo install cargo-audit --locked || true
+          cargo audit --manifest-path src-tauri/Cargo.toml --deny warnings || true
+        continue-on-error: true
+
+      - name: Backend Tests
+        run: npm run test:backend
+
+      - name: Rust Coverage
+        run: |
+          cargo install cargo-tarpaulin --locked || true
+          cargo tarpaulin --manifest-path src-tauri/Cargo.toml \
+            --lib --tests --out json \
+            --output-dir dist \
+            --skip-clean \
+            -- --test-threads=1
+          mv dist/tarpaulin-report.json dist/rust-coverage.json || true
+        continue-on-error: true
+
+      - name: Upload Coverage Summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitest-coverage-summary
+          path: dist/coverage/coverage-summary.json
+          if-no-files-found: ignore
+
+      - name: Upload Perf Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-reports
+          path: |
+            dist/perf-summary.json
+            dist/perf-risk-chip-benchmark.json
+            dist/rust-coverage.json
+          if-no-files-found: ignore
+
+      - name: Publish Quality Summary
+        if: always()
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+
+          function readJson(path) {
+            try {
+              return JSON.parse(fs.readFileSync(path, 'utf8'));
+            } catch {
+              return null;
+            }
+          }
+
+          const lines = ['## Quality Gate Summary'];
+
+          const coverage = readJson('dist/coverage/coverage-summary.json');
+          if (coverage && coverage.total) {
+            const total = coverage.total;
+            lines.push(
+              '',
+              '### Coverage',
+              `- lines: ${total.lines.pct}%`,
+              `- statements: ${total.statements.pct}%`,
+              `- branches: ${total.branches.pct}%`,
+              `- functions: ${total.functions.pct}%`
+            );
+          } else {
+            lines.push('', '### Coverage', '- unavailable');
+          }
+
+          const perf = readJson('dist/perf-summary.json');
+          if (perf && perf.stats) {
+            lines.push(
+              '',
+              '### Bundle Perf',
+              `- total JS: ${perf.stats.totalJsKB} KB`,
+              `- largest chunk: ${perf.stats.largestJsKB} KB`,
+              `- chunk count: ${perf.stats.chunkCount}`
+            );
+          }
+
+          const riskPerf = readJson('dist/perf-risk-chip-benchmark.json');
+          if (riskPerf && Array.isArray(riskPerf.cases)) {
+            lines.push('', '### Risk Benchmark');
+            riskPerf.cases.forEach((item) => {
+              lines.push(`- ${item.label}: avg=${item.avgMs}ms, p95=${item.p95Ms}ms, max=${item.maxMs}ms`);
+            });
+          }
+
+          const rustCov = readJson('dist/rust-coverage.json');
+          if (rustCov && typeof rustCov.coverage === 'number') {
+            lines.push(
+              '',
+              '### Rust Coverage (tarpaulin)',
+              `- line coverage: ${rustCov.coverage.toFixed(1)}%`
+            );
+          } else if (rustCov && rustCov.files) {
+            const total = rustCov.files.reduce((acc, f) => {
+              acc.covered += f.covered || 0;
+              acc.coverable += f.coverable || 0;
+              return acc;
+            }, { covered: 0, coverable: 0 });
+            const pct = total.coverable > 0 ? (total.covered / total.coverable * 100).toFixed(1) : 'N/A';
+            lines.push(
+              '',
+              '### Rust Coverage (tarpaulin)',
+              `- line coverage: ${pct}%`,
+              `- covered: ${total.covered} / ${total.coverable} lines`
+            );
+          }
+
+          fs.appendFileSync(summaryPath, `${lines.join('\n')}\n`);
+          NODE

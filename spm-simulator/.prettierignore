@@ -1,0 +1,38 @@
+# Dependencies
+node_modules
+package-lock.json
+
+# Build outputs
+dist
+build
+.next
+out
+
+# Tauri
+src-tauri/target
+src-tauri/Cargo.lock
+
+# Test coverage
+coverage
+.nyc_output
+dist/coverage
+
+# Logs
+*.log
+logs
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Misc
+.env
+.env.local
+.env.*.local
