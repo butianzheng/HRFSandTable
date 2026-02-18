@@ -626,4 +626,37 @@ describe('RiskOverview 交互回归', () => {
     expect(await screen.findByText('风险处理摘要（单条）')).toBeInTheDocument();
     expect(screen.getByText(/生效 1/)).toBeInTheDocument();
   }, 10000);
+
+  it('rolling_temp info 风险不允许应用建议', async () => {
+    const user = userEvent.setup();
+    mockedScheduleApi.evaluateRisks.mockResolvedValueOnce({
+      ...analysis,
+      risk_high: 1,
+      risk_medium: 1,
+      risk_low: 0,
+      violations: [
+        ...analysis.violations,
+        {
+          constraint_type: 'rolling_temp',
+          severity: 'info',
+          message: '滚动适温: 预计2026-02-20适温',
+          material_id: 102,
+          coil_id: 'C102',
+          sequence: 2,
+          due_bucket: 'in7',
+          due_date: '2026-02-07',
+        },
+      ],
+    });
+    renderRiskPage();
+
+    const rollingRow = (await screen.findByText('滚动适温: 预计2026-02-20适温')).closest(
+      'tr'
+    ) as HTMLElement;
+    const applyButton = within(rollingRow).getByRole('button', { name: '应用' });
+    expect(applyButton).toBeDisabled();
+
+    await user.click(applyButton);
+    expect(mockedScheduleApi.applyRiskSuggestion).not.toHaveBeenCalled();
+  });
 });

@@ -589,6 +589,7 @@ export function useRiskData({ navigate, searchParams, riskListCardRef }: UseRisk
         const targetRow = row as RiskViolationRow;
         const ct = targetRow.constraint_type;
         const coil = targetRow.coil_id || '未知';
+        const applyDisabled = !!targetRow.ignored || targetRow.severity === 'info';
         let desc: string;
         switch (ct) {
           case 'overdue_priority':
@@ -620,7 +621,7 @@ export function useRiskData({ navigate, searchParams, riskListCardRef }: UseRisk
                 type="link"
                 size="small"
                 loading={applyingRiskIndex === targetRow.risk_index}
-                disabled={!!targetRow.ignored}
+                disabled={applyDisabled}
               >
                 应用
               </Button>

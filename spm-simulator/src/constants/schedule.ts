@@ -88,6 +88,7 @@ export const riskApplyReasonLabelMap: Record<string, string> = {
   smart_reposition: '智能重定位',
   safe_forward: '安全前移',
   moved_to_next_shift: '移至下一班次',
+  non_actionable: '提示类风险',
 };
 
 // ─── 交期属性代码 ───

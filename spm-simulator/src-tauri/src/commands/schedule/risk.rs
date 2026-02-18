@@ -173,36 +173,38 @@ pub async fn get_risk_analysis(plan_id: i32) -> Result<RiskAnalysis, AppError> {
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
 
-    let (width_jump_threshold, thickness_jump_threshold) = if let Some(strategy_id) = plan.strategy_id
-    {
-        let strategy = strategy_template::Entity::find_by_id(strategy_id).one(db).await?;
+    let (width_jump_threshold, thickness_jump_threshold) =
+        if let Some(strategy_id) = plan.strategy_id {
+            let strategy = strategy_template::Entity::find_by_id(strategy_id)
+                .one(db)
+                .await?;
 
-        let width = strategy
-            .as_ref()
-            .and_then(|s| validator::parse_hard_constraints(&s.constraints).ok())
-            .and_then(|cfg| {
-                cfg.constraints
-                    .into_iter()
-                    .find(|c| c.constraint_type == "width_jump" && c.enabled)
-                    .and_then(|c| c.max_value)
-            })
-            .unwrap_or(100.0);
+            let width = strategy
+                .as_ref()
+                .and_then(|s| validator::parse_hard_constraints(&s.constraints).ok())
+                .and_then(|cfg| {
+                    cfg.constraints
+                        .into_iter()
+                        .find(|c| c.constraint_type == "width_jump" && c.enabled)
+                        .and_then(|c| c.max_value)
+                })
+                .unwrap_or(100.0);
 
-        let thickness = strategy
-            .and_then(|s| s.soft_constraints)
-            .and_then(|soft| validator::parse_soft_constraints(&soft).ok())
-            .and_then(|cfg| {
-                cfg.constraints
-                    .into_iter()
-                    .find(|c| c.constraint_type == "thickness_jump" && c.enabled)
-                    .and_then(|c| c.threshold)
-            })
-            .unwrap_or(1.0);
+            let thickness = strategy
+                .and_then(|s| s.soft_constraints)
+                .and_then(|soft| validator::parse_soft_constraints(&soft).ok())
+                .and_then(|cfg| {
+                    cfg.constraints
+                        .into_iter()
+                        .find(|c| c.constraint_type == "thickness_jump" && c.enabled)
+                        .and_then(|c| c.threshold)
+                })
+                .unwrap_or(1.0);
 
-        (width, thickness)
-    } else {
-        (100.0, 1.0)
-    };
+            (width, thickness)
+        } else {
+            (100.0, 1.0)
+        };
 
     // 解析风险标记
     let mut violations = Vec::new();
@@ -541,6 +543,33 @@ pub async fn unignore_risk(
 
 /// 重新计算排程项的 risk_flags 并更新方案评分。
 /// 在排程序位变更（如应用风险建议、手动拖拽）后调用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReadyDatePlacement {
+    AvailableAtStart(String),
+    Rolling(String),
+    Excluded,
+}
+
+fn classify_ready_date_in_plan(
+    ready_date: &str,
+    plan_start: chrono::NaiveDate,
+    plan_end: chrono::NaiveDate,
+) -> ReadyDatePlacement {
+    let Ok(rd) = chrono::NaiveDate::parse_from_str(ready_date, "%Y-%m-%d") else {
+        log::warn!("[风险] 滚动适温日期格式非法: {}", ready_date);
+        return ReadyDatePlacement::Excluded;
+    };
+
+    let date_text = rd.format("%Y-%m-%d").to_string();
+    if rd <= plan_start {
+        ReadyDatePlacement::AvailableAtStart(date_text)
+    } else if rd <= plan_end {
+        ReadyDatePlacement::Rolling(date_text)
+    } else {
+        ReadyDatePlacement::Excluded
+    }
+}
+
 async fn recalculate_risk_flags(plan_id: i32) -> Result<(), AppError> {
     use crate::db::get_db;
     use crate::models::{material, schedule_item, schedule_plan, strategy_template};
@@ -580,6 +609,11 @@ async fn recalculate_risk_flags(plan_id: i32) -> Result<(), AppError> {
         .find(|c| c.constraint_type == "shift_capacity")
         .and_then(|c| c.max_value)
         .unwrap_or(1200.0);
+    let plan_start = chrono::NaiveDate::parse_from_str(&plan.start_date, "%Y-%m-%d")
+        .unwrap_or_else(|_| chrono::Utc::now().date_naive());
+    let plan_end =
+        chrono::NaiveDate::parse_from_str(&plan.end_date, "%Y-%m-%d").unwrap_or(plan_start);
+    let temper_config = crate::services::temp_service::load_temper_config().await?;
 
     // 2. 按新序位加载排程项和材料
     let items = schedule_item::Entity::find()
@@ -599,6 +633,32 @@ async fn recalculate_risk_flags(plan_id: i32) -> Result<(), AppError> {
     };
     let mat_map: std::collections::HashMap<i32, material::Model> =
         mats.into_iter().map(|m| (m.id, m)).collect();
+    let mut earliest_date_by_material: std::collections::HashMap<i32, Option<String>> =
+        std::collections::HashMap::new();
+    let mut rolling_ready_date_by_material: std::collections::HashMap<i32, String> =
+        std::collections::HashMap::new();
+
+    for m in mat_map.values() {
+        let mut earliest_schedule_date = None;
+        if m.temp_status.as_deref() != Some("ready") {
+            if let Some(ready_date) =
+                crate::services::temp_service::calculate_ready_date(&m.coiling_time, &temper_config)
+            {
+                match classify_ready_date_in_plan(&ready_date, plan_start, plan_end) {
+                    ReadyDatePlacement::AvailableAtStart(date) => {
+                        // 开始日前可适温：在计划视角视为合法，不计 temp_status 高风险
+                        earliest_schedule_date = Some(date);
+                    }
+                    ReadyDatePlacement::Rolling(date) => {
+                        earliest_schedule_date = Some(date.clone());
+                        rolling_ready_date_by_material.insert(m.id, date);
+                    }
+                    ReadyDatePlacement::Excluded => {}
+                }
+            }
+        }
+        earliest_date_by_material.insert(m.id, earliest_schedule_date);
+    }
 
     // 3. 按排程序位构建 SortedMaterial 序列（sort_keys 留空，校验器不使用）
     let sorted: Vec<SortedMaterial> = items
@@ -607,7 +667,7 @@ async fn recalculate_risk_flags(plan_id: i32) -> Result<(), AppError> {
             mat_map.get(&it.material_id).map(|m| SortedMaterial {
                 material: m.clone(),
                 sort_keys: vec![],
-                earliest_schedule_date: None,
+                earliest_schedule_date: earliest_date_by_material.get(&m.id).cloned().flatten(),
             })
         })
         .collect();
@@ -684,6 +744,15 @@ async fn recalculate_risk_flags(plan_id: i32) -> Result<(), AppError> {
                     "material_id": mat_id,
                 }));
             }
+        }
+        if let Some(ready_date) = rolling_ready_date_by_material.get(&it.material_id) {
+            flag_vec.push(serde_json::json!({
+                "constraint_type": "rolling_temp",
+                "severity": "info",
+                "message": format!("滚动适温: 预计{}适温", ready_date),
+                "material_id": it.material_id,
+                "ready_date": ready_date,
+            }));
         }
 
         let risk_json = if flag_vec.is_empty() {
@@ -774,6 +843,18 @@ pub async fn apply_risk_suggestion(
         .get(idx)
         .cloned()
         .ok_or_else(|| AppError::Internal(format!("风险项不存在: index={}", idx)))?;
+    if violation.severity == "info" {
+        return Ok(ApplyRiskSuggestionResult {
+            risk_id,
+            changed: false,
+            reason_code: "non_actionable".to_string(),
+            constraint_type: violation.constraint_type,
+            material_id: violation.material_id,
+            coil_id: violation.coil_id,
+            sequence: violation.sequence,
+            action_note: "提示类风险不支持应用建议".to_string(),
+        });
+    }
 
     let db = get_db();
     let mut items = schedule_item::Entity::find()
@@ -1314,4 +1395,40 @@ pub async fn get_waiting_forecast_details(
     });
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_ready_date_in_plan, ReadyDatePlacement};
+    use chrono::NaiveDate;
+
+    #[test]
+    fn classify_ready_date_should_mark_before_start_as_available_at_start() {
+        let start = NaiveDate::from_ymd_opt(2026, 2, 20).expect("valid start");
+        let end = NaiveDate::from_ymd_opt(2026, 2, 28).expect("valid end");
+        let placement = classify_ready_date_in_plan("2026-02-18", start, end);
+        assert_eq!(
+            placement,
+            ReadyDatePlacement::AvailableAtStart("2026-02-18".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_ready_date_should_mark_in_plan_window_as_rolling() {
+        let start = NaiveDate::from_ymd_opt(2026, 2, 20).expect("valid start");
+        let end = NaiveDate::from_ymd_opt(2026, 2, 28).expect("valid end");
+        let placement = classify_ready_date_in_plan("2026-02-22", start, end);
+        assert_eq!(
+            placement,
+            ReadyDatePlacement::Rolling("2026-02-22".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_ready_date_should_exclude_after_plan_end() {
+        let start = NaiveDate::from_ymd_opt(2026, 2, 20).expect("valid start");
+        let end = NaiveDate::from_ymd_opt(2026, 2, 28).expect("valid end");
+        let placement = classify_ready_date_in_plan("2026-03-01", start, end);
+        assert_eq!(placement, ReadyDatePlacement::Excluded);
+    }
 }
