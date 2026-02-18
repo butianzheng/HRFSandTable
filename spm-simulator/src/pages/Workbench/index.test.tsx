@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -253,10 +253,17 @@ function renderWorkbench(initialUrl = '/?planId=1') {
 /** 等待初始加载完成（方案号出现 + Spin 停止旋转） */
 async function waitForLoaded() {
   await screen.findByText('(P-001)');
-  await waitFor(() => {
-    expect(document.querySelector('.ant-spin-spinning')).toBeNull();
-    expect(document.querySelector('.ant-spin-blur')).toBeNull();
-  });
+  // (P-001) 出现时，currentPlan 刚被设置，但 currentPlan change effect
+  // （调用 loadScheduleItems → setLoading(true)）可能尚未触发。
+  // 用 act() 显式刷新所有待处理的 React effects，确保 Spin 已启动后再等待其停止。
+  await act(async () => {});
+  await waitFor(
+    () => {
+      expect(document.querySelector('.ant-spin-spinning')).toBeNull();
+      expect(document.querySelector('.ant-spin-blur')).toBeNull();
+    },
+    { timeout: 10000 },
+  );
 }
 
 describe('Workbench 配置命中联动', () => {

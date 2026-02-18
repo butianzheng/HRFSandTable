@@ -117,6 +117,16 @@ enum PickMode {
     GreedyOnly,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReadyDatePlacement {
+    /// 在方案开始日前（含当天）即达到适温，方案首日可排
+    AvailableAtStart,
+    /// 方案期内某天达到适温，需滚动释放
+    Rolling(String),
+    /// 超出方案期或日期非法，不纳入本次方案
+    Excluded,
+}
+
 #[derive(Debug, Clone)]
 struct CandidateEval {
     need_roll_change: bool,
@@ -237,38 +247,38 @@ pub async fn auto_schedule(plan_id: i32, strategy_id: i32) -> Result<ScheduleOut
         .cloned()
         .collect();
 
-    // 期内将适温材料（仅多日方案）
+    // 待温材料分流：
+    //   1) ready_date <= plan_start: 方案首日可排
+    //   2) plan_start < ready_date <= plan_end: 期内滚动释放
+    //   3) ready_date > plan_end: 不纳入本次方案
     let mut future_ready_map: HashMap<i32, String> = HashMap::new();
-    if plan_start != plan_end {
-        for m in active_materials
-            .iter()
-            .filter(|m| m.temp_status.as_deref() != Some("ready"))
-        {
-            if let Some(ready_date) =
-                temp_service::calculate_ready_date(&m.coiling_time, &temper_config)
-            {
-                if ready_date.as_str() >= plan.start_date.as_str()
-                    && ready_date.as_str() <= plan.end_date.as_str()
-                {
-                    future_ready_map.insert(m.id, ready_date);
+    let mut all_candidate_materials = ready_materials;
+    let mut ready_before_start_count = 0usize;
+    for m in active_materials
+        .iter()
+        .filter(|m| m.temp_status.as_deref() != Some("ready"))
+    {
+        if let Some(ready_date) = temp_service::calculate_ready_date(&m.coiling_time, &temper_config) {
+            match classify_ready_date_in_plan(&ready_date, plan_start, plan_end) {
+                ReadyDatePlacement::AvailableAtStart => {
+                    all_candidate_materials.push(m.clone());
+                    ready_before_start_count += 1;
                 }
+                ReadyDatePlacement::Rolling(date) => {
+                    future_ready_map.insert(m.id, date);
+                    all_candidate_materials.push(m.clone());
+                }
+                ReadyDatePlacement::Excluded => {}
             }
         }
     }
 
-    // 合并材料池
-    let mut all_candidate_materials = ready_materials;
-    for m in &active_materials {
-        if future_ready_map.contains_key(&m.id) {
-            all_candidate_materials.push(m.clone());
-        }
-    }
-
-    let ready_count = all_candidate_materials.len() - future_ready_map.len();
+    let ready_now_count = all_candidate_materials.len() - future_ready_map.len();
     let future_count = future_ready_map.len();
     log::info!(
-        "[排程] 适温材料: {}, 期内将适温: {}, 合计: {}",
-        ready_count,
+        "[排程] 可立即排程: {} (其中开始日前将适温: {}), 期内将适温: {}, 合计: {}",
+        ready_now_count,
+        ready_before_start_count,
         future_count,
         all_candidate_materials.len(),
     );
@@ -1080,9 +1090,29 @@ pub fn next_date(date_str: &str) -> String {
     }
 }
 
+fn classify_ready_date_in_plan(
+    ready_date: &str,
+    plan_start: NaiveDate,
+    plan_end: NaiveDate,
+) -> ReadyDatePlacement {
+    let Ok(rd) = NaiveDate::parse_from_str(ready_date, "%Y-%m-%d") else {
+        log::warn!("[排程] 滚动适温日期格式非法: {}", ready_date);
+        return ReadyDatePlacement::Excluded;
+    };
+
+    if rd <= plan_start {
+        ReadyDatePlacement::AvailableAtStart
+    } else if rd <= plan_end {
+        ReadyDatePlacement::Rolling(rd.format("%Y-%m-%d").to_string())
+    } else {
+        ReadyDatePlacement::Excluded
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveDate;
     use crate::engine::test_helpers::helpers::{make_material, wrap};
 
     #[test]
@@ -1190,5 +1220,35 @@ mod tests {
 
         assert_eq!(pick.0, 0);
         assert_eq!(pick.1, PickMode::GreedyFallback);
+    }
+
+    #[test]
+    fn classify_ready_date_in_plan_should_include_before_start_as_available() {
+        let plan_start = NaiveDate::from_ymd_opt(2026, 2, 20).unwrap();
+        let plan_end = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        assert_eq!(
+            classify_ready_date_in_plan("2026-02-19", plan_start, plan_end),
+            ReadyDatePlacement::AvailableAtStart
+        );
+    }
+
+    #[test]
+    fn classify_ready_date_in_plan_should_mark_in_range_as_rolling() {
+        let plan_start = NaiveDate::from_ymd_opt(2026, 2, 20).unwrap();
+        let plan_end = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        assert_eq!(
+            classify_ready_date_in_plan("2026-02-21", plan_start, plan_end),
+            ReadyDatePlacement::Rolling("2026-02-21".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_ready_date_in_plan_should_exclude_after_end() {
+        let plan_start = NaiveDate::from_ymd_opt(2026, 2, 20).unwrap();
+        let plan_end = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        assert_eq!(
+            classify_ready_date_in_plan("2026-05-01", plan_start, plan_end),
+            ReadyDatePlacement::Excluded
+        );
     }
 }

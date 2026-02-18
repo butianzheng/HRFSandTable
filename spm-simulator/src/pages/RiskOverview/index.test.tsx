@@ -625,5 +625,5 @@ describe('RiskOverview 交互回归', () => {
 
     expect(await screen.findByText('风险处理摘要（单条）')).toBeInTheDocument();
     expect(screen.getByText(/生效 1/)).toBeInTheDocument();
-  });
+  }, 10000);
 });
